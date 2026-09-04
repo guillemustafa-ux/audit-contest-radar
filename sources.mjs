@@ -15,7 +15,7 @@ const UA = {
 
 const TERMINAL_STATUSES = new Set([
   'finished', 'completed', 'complete', 'escalations_ended', 'reporting',
-  'sherlock_judging', 'judging', 'ended', 'closed',
+  'sherlock_judging', 'judging', 'ended', 'closed', 'evaluating',
 ]);
 
 export function isTerminal(status) {
@@ -221,6 +221,11 @@ async function codehawks() {
 // ---------------------------------------------------------------- Immunefi
 // Audit competitions live in a Next.js App Router RSC payload. This is the most
 // brittle source of the five, so failures here must never sink the run.
+//
+// Each competition is a JSON object starting with {"contentfulId":...,"slug":...}.
+// We slice the payload per object so fields never leak from a neighbouring
+// competition (a fixed +-N char window previously picked up the PREVIOUS
+// contest's endDate and reported finished comps as live).
 
 async function immunefi() {
   const html = await getText('https://immunefi.com/audit-competition/');
@@ -228,31 +233,40 @@ async function immunefi() {
     .map((m) => m[1]).join('');
   const payload = chunks.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
 
+  const starts = [...payload.matchAll(/\{"contentfulId":"[^"]+","slug":"([a-z0-9-]{4,})"/g)];
   const out = [];
   const seen = new Set();
-  // Look for objects carrying an audit-competition slug alongside a date.
-  for (const m of payload.matchAll(/"slug":"([a-z0-9-]{4,})"/g)) {
-    const slug = m[1];
+  for (let i = 0; i < starts.length; i++) {
+    const slug = starts[i][1];
     if (seen.has(slug)) continue;
     seen.add(slug);
-    const ctx = payload.slice(Math.max(0, m.index - 1200), m.index + 1200);
-    if (!/endDate|startDate|maxBounty|reward/i.test(ctx)) continue;
+    const from = starts[i].index;
+    const to = i + 1 < starts.length ? starts[i + 1].index : from + 4000;
+    const obj = payload.slice(from, to);
+    if (!/"endDate"|"launchDate"|"maxBounty"|"rewardsPool"/.test(obj)) continue;
 
-    const end = ctx.match(/"endDate":"([^"]+)"/);
-    const start = ctx.match(/"startDate":"([^"]+)"/);
-    const pot = ctx.match(/"(?:maxBounty|rewardPool|totalRewards?)":"?([\d.]+)"?/i);
-    const name = slug.replace(/[-_]/g, ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
+    const field = (key) => obj.match(new RegExp(`"${key}":"([^"]*)"`))?.[1] ?? null;
+    const num = (key) => obj.match(new RegExp(`"${key}":"?([\\d.]+)"?`))?.[1] ?? null;
+    const list = (key) => (obj.match(new RegExp(`"${key}":\\[([^\\]]*)\\]`))?.[1] ?? '')
+      .split(',').map((s) => s.replace(/"/g, '').trim()).filter(Boolean);
+
+    const pot = num('rewardsPool') ?? num('maxBounty');
+    const name = field('project')?.replace(/^Audit Comp(?:etition)?\s*\|\s*/i, '')
+      ?? slug.replace(/[-_]/g, ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
+    const start = field('launchDate');
+    const end = field('endDate');
+    const stackHint = [...list('language'), ...list('ecosystem'), ...list('technologies')].join(' ');
 
     out.push({
       platform: 'Immunefi',
       id: slug,
       name,
-      prizePoolUsd: pot ? parseAmount(pot[1]) : null,
-      prizeLabel: pot ? `$${Number(parseAmount(pot[1])).toLocaleString('en-US')}` : null,
-      startDate: start ? new Date(start[1]) : null,
-      endDate: end ? new Date(end[1]) : null,
-      stack: inferStack(ctx.slice(0, 2000)),
-      status: null,
+      prizePoolUsd: pot ? parseAmount(pot) : null,
+      prizeLabel: pot ? `$${Number(parseAmount(pot)).toLocaleString('en-US')}` : null,
+      startDate: start ? new Date(start) : null,
+      endDate: end ? new Date(end) : null,
+      stack: inferStack(stackHint || obj),
+      status: field('auditCompetitionStatus'),
       url: `https://immunefi.com/audit-competition/${slug}/`,
       description: '',
     });
