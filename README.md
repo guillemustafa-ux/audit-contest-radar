@@ -88,7 +88,16 @@ node check.mjs                  # normal run: notifies and advances state
 node check.mjs --dry-run        # print what it would send; touches nothing
 node check.mjs --reset          # wipe state, then run
 node check.mjs --test-telegram  # send a test message and exit
+node run.mjs                    # stateless: print actionable contests as JSON, no state, no notify
 ```
+
+### Cloud scheduled task
+
+A Claude Code cloud scheduled task also runs the radar, with this repository selected as
+its only source and `node run.mjs` as the command. Auto mode trusts the session's working
+directory, so the task runs this repo's own committed code there. The earlier setup cloned
+the repo mid-run and wrote the runner on the fly, which the classifier denied as
+`[Code from External]`.
 
 ## Configuration
 
@@ -128,6 +137,7 @@ scraper would alert twice a day forever.
 - `sources.mjs` — one adapter per platform, normalizing to a common shape
 - `profile.mjs` — two-layer fit scoring (domain signals + specialty keywords)
 - `check.mjs` — orchestration, diffing, rendering, Telegram push
+- `run.mjs` — stateless JSON runner used by the cloud scheduled task
 - `calibrate.mjs` — regression test for the scorer; run after touching `profile.mjs`
 - `run.ps1` — Task Scheduler wrapper, appends to `radar.log`
 - `state.json` — generated; IDs already notified
