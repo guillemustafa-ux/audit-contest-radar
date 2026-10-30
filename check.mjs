@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Audit Contest Radar — detects newly announced smart contract audit contests
-// across Sherlock, Code4rena, Cantina, CodeHawks and Immunefi, and pushes a
+// across Sherlock, Cantina (contests and bounties), CodeHawks and Immunefi, and pushes a
 // Telegram digest only when something new shows up.
 //
 // Usage:
@@ -12,7 +12,7 @@
 import { readFile, writeFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { fetchAll, isTerminal } from './sources.mjs';
+import { fetchAll, isLive } from './sources.mjs';
 import { scoreContest, LEVEL_MARK } from './profile.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -69,14 +69,9 @@ async function sendTelegram(text) {
   return body;
 }
 
-// A contest is actionable if there is still time to join it. We key off dates
-// rather than status strings — see the design note in sources.mjs.
+// A contest is actionable if there is still time to join it (shared rule in sources.mjs).
 function isActionable(c, now) {
-  if (isTerminal(c.status)) return false;
-  if (c.endDate instanceof Date && !isNaN(c.endDate)) return c.endDate > now;
-  // CodeHawks does not expose dates in its listing. Rather than drop those
-  // silently, keep them and let the digest flag the uncertainty.
-  return c.datesUnknown === true;
+  return isLive(c, now);
 }
 
 function passesPrize(c) {
@@ -89,8 +84,8 @@ function passesPrize(c) {
 
 function renderContest(c, fit, now) {
   const mark = LEVEL_MARK[fit.level] ?? '•';
-  const window = c.datesUnknown
-    ? 'fechas no publicadas en el listado'
+  const window = c.ongoing
+    ? `Bounty abierto desde ${fmtDate(c.startDate)}, sin fecha de cierre`
     : `Abre: ${fmtDate(c.startDate)} · Cierra: ${fmtDate(c.endDate)}` +
       (daysBetween(c.startDate, c.endDate) != null ? ` (${daysBetween(c.startDate, c.endDate)} dias)` : '');
 

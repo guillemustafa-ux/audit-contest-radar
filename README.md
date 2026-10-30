@@ -1,7 +1,7 @@
 # Audit Contest Radar
 
-Detects newly announced smart contract audit contests across **Sherlock, Code4rena,
-Cantina, CodeHawks and Immunefi**, scores each one against a fixed auditor profile,
+Detects newly announced smart contract audit contests across **Sherlock, Cantina
+(contests and new bounties), CodeHawks and Immunefi**, scores each one against a fixed auditor profile,
 and pushes a Telegram digest only when something new appears.
 
 Runs twice a day via Task Scheduler (10:07 and 16:07 local).
@@ -16,23 +16,28 @@ right now". A contest announced today for next Thursday shows up today.
 
 | Platform | Method | Notes |
 |---|---|---|
-| Sherlock | `mainnet-contest.sherlock.xyz/contests` | JSON, paginated 10/page, epoch-second dates |
-| Code4rena | `code4rena.com/api/v1/audits` | JSON, list nested at `data.audits`, 25/page |
+| Sherlock | `audits.sherlock.xyz/api/contests/stats` + `mainnet-contest.sherlock.xyz/contests?status=` | JSON; every non-terminal status the stats report is listed in full, plus the first 3 default pages; epoch-second dates |
 | Cantina | `cantina.xyz/api/v0/competitions` | JSON, flat array, private contests filtered out |
-| CodeHawks | `codehawks.cyfrin.io/contests` | HTML scrape — no public API, every `/api/*` returns 400 |
+| Cantina bounties | `cantina.xyz/api/v0/bounties` | JSON; public bounties opened in the last 7 days (or about to open), flagged `ongoing` |
+| CodeHawks | `codehawks.cyfrin.io/contests` | The SvelteKit page embeds the competitions tRPC payload with real dates; invite-only contests filtered out |
 | Immunefi | `immunefi.com/audit-competition/` | Next.js RSC payload scrape |
 
-### Known limitation: CodeHawks dates
+Code4rena closed in May 2026 and its adapter was removed.
 
-CodeHawks publishes neither dates nor status in its listing markup, and the page serves
-the full archive back to 2023. The only liveness signal available is the `YYYY-MM` prefix
-on the contest slug, so the adapter keeps contests whose slug is within
-`CODEHAWKS_RECENT_MONTHS` (2) of today and drops the rest.
+### Why Sherlock is read by status
 
-Consequence: a recently-finished CodeHawks contest can surface once as a false positive.
-It is reported a single time and then suppressed by `state.json` forever. The alternative
-— dropping undated entries — would mean missing live CodeHawks contests entirely, which
-is the worse failure for a radar.
+The default Sherlock listing is sorted by prize pool, not by date, so a small new contest
+can sit past any fixed page count. The stats endpoint says which statuses exist right now,
+and each non-terminal one is listed in full. The statuses come from Sherlock, so a value
+never seen before is still queried (see "No status whitelist" below). Private contests are
+counted in the stats but never listed.
+
+### Bounties have no end date
+
+A bounty stays open until the project closes it, so `endDate > now` cannot decide whether
+it is live. The adapter emits only public bounties opened in the last `BOUNTY_FRESH_DAYS`
+(7) or about to open, flagged `ongoing: true`, and `isLive` treats them as live. Each new
+bounty therefore reaches the digest once, while it is fresh.
 
 ## Fit scoring
 
@@ -74,7 +79,8 @@ It fails (exit 1) if a ground-truth contest drops out of `ALTO`, if an off-profi
 contest leaks into `ALTO`, or if the `ALTO` share exceeds 25% — a scorer that calls
 everything relevant is as useless as one that calls nothing.
 
-Current state: 6/6 ground truth pass, 7/7 negative controls clean, `ALTO` share 10.6%.
+Current state (2026-10-30): 5 of 6 ground-truth contests pass and Reflector V3 is skipped
+(it came from Code4rena), no negative control leaks, `ALTO` share 12.5%.
 
 **Known miss:** `balancer-v3` scores 16/`MEDIO`. Its API description is truncated to one
 generic line, leaving nothing to extract. It is left failing on purpose rather than
@@ -89,6 +95,7 @@ node check.mjs --dry-run        # print what it would send; touches nothing
 node check.mjs --reset          # wipe state, then run
 node check.mjs --test-telegram  # send a test message and exit
 node run.mjs                    # stateless: print actionable contests as JSON, no state, no notify
+node --test test/*.test.mjs     # parser tests with inline fixtures, no network
 ```
 
 ### Cloud scheduled task
@@ -120,8 +127,8 @@ Set the token once, at user scope, so Task Scheduler inherits it:
 **No status whitelist.** This was built while every platform was between contests, so the
 string each one uses for a live contest could not be observed. Whitelisting an unseen
 value would make the radar silently miss the exact event it exists to catch. Liveness is
-derived from `endDate > now`, with a blacklist of known-terminal statuses as defence in
-depth.
+derived from `endDate > now` (or `ongoing` for bounties) in one shared `isLive`, with a
+blacklist of known-terminal statuses as defence in depth.
 
 **Notify before persisting.** `check.mjs` sends the Telegram message *first* and writes
 `state.json` only on success. A failed push means the state does not advance and the
@@ -139,6 +146,7 @@ scraper would alert twice a day forever.
 - `check.mjs` — orchestration, diffing, rendering, Telegram push
 - `run.mjs` — stateless JSON runner used by the cloud scheduled task
 - `calibrate.mjs` — regression test for the scorer; run after touching `profile.mjs`
+- `test/sources.test.mjs` — adapter parsing and liveness tests
 - `run.ps1` — Task Scheduler wrapper, appends to `radar.log`
 - `state.json` — generated; IDs already notified
 - `last-report.md` — generated; the full digest for Claude to read in-session

@@ -15,11 +15,20 @@ const UA = {
 
 const TERMINAL_STATUSES = new Set([
   'finished', 'completed', 'complete', 'escalations_ended', 'reporting',
-  'sherlock_judging', 'judging', 'ended', 'closed', 'evaluating',
+  'sherlock_judging', 'judging', 'ended', 'closed', 'evaluating', 'migrated',
 ]);
 
 export function isTerminal(status) {
   return status ? TERMINAL_STATUSES.has(String(status).toLowerCase()) : false;
+}
+
+// A contest is live while there is still time to join it, judged by its end date (see the
+// design note above). A bounty has no end date: its adapter flags it `ongoing` instead.
+export function isLive(c, now = Date.now()) {
+  if (isTerminal(c.status)) return false;
+  if (c.ongoing) return true;
+  const end = c.endDate instanceof Date ? c.endDate.getTime() : NaN;
+  return Number.isFinite(end) && end > now;
 }
 
 const FETCH_TIMEOUT_MS = 25_000;
@@ -67,62 +76,52 @@ function inferStack(...texts) {
 
 // ---------------------------------------------------------------- Sherlock
 
-async function sherlock() {
-  const out = [];
-  // Paginated, 10 per page. Live and upcoming contests surface on the first pages;
-  // 3 pages is a wide margin over anything actionable.
-  for (let page = 1; page <= 3; page++) {
-    const data = await getJson(`https://mainnet-contest.sherlock.xyz/contests?page=${page}`);
-    const items = data?.items ?? [];
-    for (const c of items) {
-      out.push({
-        platform: 'Sherlock',
-        id: String(c.id),
-        name: c.title ?? `contest ${c.id}`,
-        prizePoolUsd: parseAmount(c.rewards ?? c.prize_pool),
-        prizeLabel: c.prize_pool ? `$${Number(c.prize_pool).toLocaleString('en-US')} ${c.token ?? ''}`.trim() : null,
-        startDate: c.starts_at ? new Date(c.starts_at * 1000) : null,
-        endDate: c.ends_at ? new Date(c.ends_at * 1000) : null,
-        stack: inferStack(c.title, c.short_description),
-        status: c.status ?? null,
-        url: `https://audits.sherlock.xyz/contests/${c.id}`,
-        description: c.short_description ?? '',
-      });
-    }
-    if (!data?.has_next) break;
-  }
-  return out;
+// The public listing is sorted by prize pool, not by date, so a small new contest can sit
+// past any fixed page count. The stats endpoint reports which statuses exist right now and
+// every non-terminal one is listed in full: the statuses come from Sherlock, not from a
+// whitelist here. Private contests are counted in the stats but never listed, so a
+// non-terminal status can legitimately return no items. The first pages of the default
+// listing are still read too: calibrate.mjs anchors its ground truth on the large finished
+// contests there.
+export function sherlockStatusesToQuery(stats) {
+  if (!Array.isArray(stats)) return [];
+  return stats.filter((s) => s.count > 0 && !isTerminal(s.status)).map((s) => s.status);
 }
 
-// --------------------------------------------------------------- Code4rena
+const SHERLOCK_MAX_PAGES = 20; // 10 per page; a guard against a has_next that never ends
+const SHERLOCK_DEFAULT_PAGES = 3;
 
-async function code4rena() {
+async function sherlock() {
+  // Without stats, fall back to the default pages alone: the coverage this adapter had before.
+  const stats = await getJson('https://audits.sherlock.xyz/api/contests/stats').catch(() => []);
+  const queries = [
+    ...sherlockStatusesToQuery(stats).map((s) => ({ filter: `status=${encodeURIComponent(s)}&`, pages: SHERLOCK_MAX_PAGES })),
+    { filter: '', pages: SHERLOCK_DEFAULT_PAGES },
+  ];
   const out = [];
-  // 25 per page, sorted newest-first. Two pages covers anything live or upcoming.
-  for (let page = 1; page <= 2; page++) {
-    const data = await getJson(`https://code4rena.com/api/v1/audits?page=${page}`);
-    // The payload nests the list as data.audits. Fall back to any array under data
-    // so a key rename degrades into a warning rather than a silently empty source.
-    const rows = data?.data?.audits
-      ?? (Array.isArray(data?.data) ? data.data : Object.values(data?.data ?? {}).find(Array.isArray))
-      ?? [];
-    if (!rows.length && page === 1) throw new Error('Code4rena returned no rows — payload shape may have changed');
-    for (const c of rows) {
-      out.push({
-        platform: 'Code4rena',
-        id: String(c.contestId ?? c.uid ?? c.slug),
-        name: c.title ?? c.slug,
-        prizePoolUsd: parseAmount(c.formattedAmount),
-        prizeLabel: c.formattedAmount ?? null,
-        startDate: c.startTime ? new Date(c.startTime) : null,
-        endDate: c.endTime ? new Date(c.endTime) : null,
-        stack: inferStack(c.title, c.details, c.repo, c.league),
-        status: c.status ?? null,
-        url: c.slug ? `https://code4rena.com/audits/${c.slug}` : 'https://code4rena.com/audits',
-        description: c.details ?? '',
-      });
+  const seen = new Set();
+  for (const { filter, pages } of queries) {
+    for (let page = 1; page <= pages; page++) {
+      const data = await getJson(`https://mainnet-contest.sherlock.xyz/contests?${filter}page=${page}`);
+      for (const c of data?.items ?? []) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        out.push({
+          platform: 'Sherlock',
+          id: String(c.id),
+          name: c.title ?? `contest ${c.id}`,
+          prizePoolUsd: parseAmount(c.rewards ?? c.prize_pool),
+          prizeLabel: c.prize_pool ? `$${Number(c.prize_pool).toLocaleString('en-US')} ${c.token ?? ''}`.trim() : null,
+          startDate: c.starts_at ? new Date(c.starts_at * 1000) : null,
+          endDate: c.ends_at ? new Date(c.ends_at * 1000) : null,
+          stack: inferStack(c.title, c.short_description),
+          status: c.status ?? null,
+          url: `https://audits.sherlock.xyz/contests/${c.id}`,
+          description: c.short_description ?? '',
+        });
+      }
+      if (!data?.has_next) break;
     }
-    if (!data?.pagination?.nextPage) break;
   }
   return out;
 }
@@ -151,71 +150,78 @@ async function cantina() {
   })).filter((c) => !c.private);
 }
 
+// -------------------------------------------------------- Cantina bounties
+// A bounty has no end date: it stays open until the project closes it, so liveness cannot
+// come from endDate. Only public bounties opened in the last BOUNTY_FRESH_DAYS (or about to
+// open) are emitted, flagged `ongoing`; the alert dedup then reports each one once.
+
+const BOUNTY_FRESH_DAYS = 7;
+
+export function mapCantinaBounties(rows, now = Date.now()) {
+  const since = now - BOUNTY_FRESH_DAYS * 86_400_000;
+  return rows
+    .filter((b) => b.kind === 'public_bounty' && !isTerminal(b.status))
+    .map((b) => ({ b, opened: Date.parse(b.timeframe?.start ?? b.createdAt) }))
+    .filter(({ opened }) => Number.isFinite(opened) && opened >= since)
+    .map(({ b, opened }) => ({
+      platform: 'Cantina bounty',
+      id: String(b.id),
+      name: b.name ?? b.company?.name ?? 'unnamed',
+      prizePoolUsd: parseAmount(b.totalRewardPot),
+      prizeLabel: b.totalRewardPot
+        ? `$${Number(parseAmount(b.totalRewardPot)).toLocaleString('en-US')} ${b.currencyCode ?? ''}`.trim()
+        : null,
+      startDate: new Date(opened),
+      endDate: null,
+      ongoing: true,
+      stack: inferStack(b.name, (b.instructions ?? '').slice(0, 4000)),
+      status: b.status ?? null,
+      url: b.url ?? `https://cantina.xyz/bounties/${b.id}`,
+      description: (b.instructions ?? '').slice(0, 600),
+    }));
+}
+
+async function cantinaBounties() {
+  const data = await getJson('https://cantina.xyz/api/v0/bounties');
+  const rows = Array.isArray(data) ? data : (Object.values(data).find(Array.isArray) ?? []);
+  return mapCantinaBounties(rows);
+}
+
 // --------------------------------------------------------------- CodeHawks
-// No public API (every /api/* endpoint returns HTTP 400). The listing page is
-// server-rendered HTML, and usefully labels the tech stack as tags.
+// No public REST API (every /api/* endpoint returns HTTP 400). The listing page is
+// SvelteKit and embeds the whole competitions tRPC response, real dates included, in a
+// <script type="application/json" data-sveltekit-fetched> tag.
 
-const CODEHAWKS_TAGS = [
-  'Solidity', 'Foundry', 'Rust', 'Cairo', 'Starknet', 'Solana', 'Move', 'Vyper',
-  'Layer 2', 'DeFi', 'NFT', 'Staking', 'Bridge', 'Oracle', 'AMM', 'Lending',
-];
+const CODEHAWKS_USD = /^(usdc|usdt|usd|dai)$/i;
 
-// How far back a slug's YYYY-MM prefix may be and still plausibly be running.
-// CodeHawks contests run 3-4 weeks, so two months is a generous margin.
-const CODEHAWKS_RECENT_MONTHS = 2;
+export function parseCodehawksListing(html) {
+  const tag = html.match(
+    /<script type="application\/json" data-sveltekit-fetched data-url="[^"]*competitions\.getCompetitions[^"]*"[^>]*>([\s\S]*?)<\/script>/,
+  );
+  if (!tag) throw new Error('CodeHawks competitions payload not found — page markup may have changed');
+  const rows = JSON.parse(JSON.parse(tag[1]).body)?.[0]?.result?.data;
+  if (!Array.isArray(rows)) throw new Error('CodeHawks competitions payload has an unexpected shape');
+  return rows.filter((c) => c.urlSlug && !c.inviteOnly).map((c) => {
+    const reward = parseAmount(c.reward);
+    return {
+      platform: 'CodeHawks',
+      id: c.urlSlug,
+      name: c.name ?? c.urlSlug,
+      // ETH prizes are not USD; leave the number out rather than compare apples to oranges.
+      prizePoolUsd: CODEHAWKS_USD.test(c.currency ?? '') ? reward : null,
+      prizeLabel: reward != null ? `${reward.toLocaleString('en-US')} ${(c.currency ?? '').toUpperCase()}`.trim() : null,
+      startDate: c.startDate ? new Date(c.startDate) : null,
+      endDate: c.endDate ? new Date(c.endDate) : null,
+      stack: inferStack(c.protocolTags, c.name),
+      status: null,
+      url: `https://codehawks.cyfrin.io/c/${c.urlSlug}`,
+      description: [c.company, c.protocolTags].filter(Boolean).join(' — '),
+    };
+  });
+}
 
 async function codehawks() {
-  const html = await getText('https://codehawks.cyfrin.io/contests');
-  const out = [];
-  const seen = new Set();
-
-  const cutoff = new Date();
-  cutoff.setMonth(cutoff.getMonth() - CODEHAWKS_RECENT_MONTHS);
-
-  // Each contest links to /c/<slug>. Take the surrounding markup as its card.
-  for (const m of html.matchAll(/href="(\/c\/([^"?#]+))"/g)) {
-    const slug = m[2];
-    if (seen.has(slug)) continue;
-    seen.add(slug);
-
-    // The listing is the full historical archive with no dates or status in the
-    // markup, so the slug prefix is the only liveness signal available. Without
-    // this filter the radar reports every contest since 2023 as "new".
-    const dateMatch = slug.match(/^(\d{4})-(\d{2})-/);
-    if (!dateMatch) continue;
-    const slugDate = new Date(Number(dateMatch[1]), Number(dateMatch[2]) - 1, 1);
-    if (slugDate < cutoff) continue;
-
-    const card = html.slice(Math.max(0, m.index - 6000), m.index + 6000);
-    const text = card.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
-
-    const amount = text.match(/([\d,]+(?:\.\d+)?)\s*(USDC|USD|ETH|DAI)\b/i);
-    const stack = CODEHAWKS_TAGS.filter((t) => new RegExp(`\\b${t}\\b`, 'i').test(text));
-
-    // Slugs look like "2026-04-protocol-name"; recover a readable title.
-    const name = slug.replace(/^\d{4}-\d{2}-/, '').replace(/[-_]/g, ' ')
-      .replace(/\b\w/g, (ch) => ch.toUpperCase());
-
-    let prizePoolUsd = amount ? parseAmount(amount[1]) : null;
-    // ETH prizes are not USD; leave the number out rather than compare apples to oranges.
-    if (amount && /ETH/i.test(amount[2])) prizePoolUsd = null;
-
-    out.push({
-      platform: 'CodeHawks',
-      id: slug,
-      name,
-      prizePoolUsd,
-      prizeLabel: amount ? `${amount[1]} ${amount[2].toUpperCase()}` : null,
-      startDate: slugDate,
-      endDate: null, // not exposed in the listing markup
-      stack: stack.length ? stack : inferStack(text),
-      status: null,
-      url: `https://codehawks.cyfrin.io${m[1]}`,
-      description: text.slice(0, 400),
-      datesUnknown: true,
-    });
-  }
-  return out;
+  return parseCodehawksListing(await getText('https://codehawks.cyfrin.io/contests'));
 }
 
 // ---------------------------------------------------------------- Immunefi
@@ -276,8 +282,8 @@ async function immunefi() {
 
 export const ADAPTERS = [
   { name: 'Sherlock', run: sherlock },
-  { name: 'Code4rena', run: code4rena },
   { name: 'Cantina', run: cantina },
+  { name: 'Cantina bounties', run: cantinaBounties },
   { name: 'CodeHawks', run: codehawks },
   { name: 'Immunefi', run: immunefi },
 ];
